@@ -8,7 +8,9 @@
 //!
 //! 与 Chat Completions 的 delta chunk 模型完全不同，需要独立的状态机处理。
 
-use super::reasoning_bridge::{encode_openai_reasoning_item, reasoning_summary_text};
+use super::reasoning_bridge::{
+    encode_openai_reasoning_item, reasoning_summary_text, OPAQUE_REASONING_PLACEHOLDER,
+};
 use super::transform_responses::{
     build_anthropic_usage_from_responses, map_responses_stop_reason,
     merge_web_search_result_metadata, responses_to_anthropic_with_web_search_options,
@@ -4453,14 +4455,38 @@ fn create_anthropic_sse_stream_from_responses_raw<E: std::error::Error + Send + 
                                                         "type": "content_block_start",
                                                         "index": index,
                                                         "content_block": {
-                                                            "type": "redacted_thinking",
-                                                            "data": envelope
+                                                            "type": "thinking",
+                                                            "thinking": ""
                                                         }
                                                     });
                                                     let start_sse = format!("event: content_block_start\ndata: {}\n\n",
                                                         serde_json::to_string(&start_event).unwrap_or_default());
                                                     yield Ok(Bytes::from(start_sse));
                                                     open_indices.insert(index);
+
+                                                    let placeholder_event = json!({
+                                                        "type": "content_block_delta",
+                                                        "index": index,
+                                                        "delta": {
+                                                            "type": "thinking_delta",
+                                                            "thinking": OPAQUE_REASONING_PLACEHOLDER
+                                                        }
+                                                    });
+                                                    let placeholder_sse = format!("event: content_block_delta\ndata: {}\n\n",
+                                                        serde_json::to_string(&placeholder_event).unwrap_or_default());
+                                                    yield Ok(Bytes::from(placeholder_sse));
+
+                                                    let signature_event = json!({
+                                                        "type": "content_block_delta",
+                                                        "index": index,
+                                                        "delta": {
+                                                            "type": "signature_delta",
+                                                            "signature": envelope
+                                                        }
+                                                    });
+                                                    let signature_sse = format!("event: content_block_delta\ndata: {}\n\n",
+                                                        serde_json::to_string(&signature_event).unwrap_or_default());
+                                                    yield Ok(Bytes::from(signature_sse));
                                                 }
                                             }
                                         }
@@ -7075,6 +7101,98 @@ mod tests {
 
         assert!(merged.contains("\"partial_json\":\"{\\\"q\\\":\\\"rust\\\"}\""));
         assert_eq!(merged.matches("event: content_block_stop").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_reasoning_without_summary_uses_thinking_placeholder() {
+        let input = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_reason\",\"model\":\"gpt-5.6\"}}\n\n",
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[]}}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"rs_1\",\"type\":\"reasoning\",\"summary\":[],\"encrypted_content\":\"opaque\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+        let merged = convert_stream_text(input).await;
+        let events = sse_data_values(&merged);
+
+        assert!(!merged.contains("redacted_thinking"));
+
+        let thinking_starts: Vec<(usize, &Value)> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                event.get("type").and_then(Value::as_str) == Some("content_block_start")
+                    && event.pointer("/content_block/type").and_then(Value::as_str)
+                        == Some("thinking")
+            })
+            .collect();
+        let placeholder_deltas: Vec<(usize, &Value)> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                event.pointer("/delta/type").and_then(Value::as_str) == Some("thinking_delta")
+                    && event.pointer("/delta/thinking").and_then(Value::as_str)
+                        == Some(OPAQUE_REASONING_PLACEHOLDER)
+            })
+            .collect();
+        let signature_deltas: Vec<(usize, &Value)> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                event.pointer("/delta/type").and_then(Value::as_str) == Some("signature_delta")
+            })
+            .collect();
+
+        assert_eq!(thinking_starts.len(), 1);
+        assert_eq!(placeholder_deltas.len(), 1);
+        assert_eq!(signature_deltas.len(), 1);
+
+        let block_index = thinking_starts[0].1.get("index").and_then(Value::as_u64);
+        assert!(block_index.is_some());
+        assert_eq!(
+            placeholder_deltas[0].1.get("index").and_then(Value::as_u64),
+            block_index
+        );
+        assert_eq!(
+            signature_deltas[0].1.get("index").and_then(Value::as_u64),
+            block_index
+        );
+
+        let stop_events: Vec<(usize, &Value)> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                event.get("type").and_then(Value::as_str) == Some("content_block_stop")
+                    && event.get("index").and_then(Value::as_u64) == block_index
+            })
+            .collect();
+        assert_eq!(stop_events.len(), 1);
+        assert!(thinking_starts[0].0 < placeholder_deltas[0].0);
+        assert!(placeholder_deltas[0].0 < signature_deltas[0].0);
+        assert!(signature_deltas[0].0 < stop_events[0].0);
+        assert!(!events[stop_events[0].0 + 1..].iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("content_block_delta")
+                && event.get("index").and_then(Value::as_u64) == block_index
+        }));
+
+        let original_item = json!({
+            "id": "rs_1",
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "opaque"
+        });
+        let signature = signature_deltas[0]
+            .1
+            .pointer("/delta/signature")
+            .and_then(Value::as_str)
+            .expect("signature delta includes a signature");
+        assert_eq!(
+            super::super::reasoning_bridge::decode_openai_reasoning_item(signature),
+            Some(original_item)
+        );
     }
 
     #[tokio::test]

@@ -22,6 +22,7 @@ use super::{
     thinking_rectifier::{
         normalize_thinking_type, rectify_anthropic_request, should_rectify_thinking_signature,
     },
+    timing::ProxyPhaseTimings,
     types::{CopilotOptimizerConfig, OptimizerConfig, ProxyStatus, RectifierConfig},
     ProxyError,
 };
@@ -175,6 +176,8 @@ pub struct RequestForwarder {
     session_id: String,
     /// Session ID 是否由客户端提供；生成值不能作为上游缓存身份。
     session_client_provided: bool,
+    /// 跨转发、重试和响应处理共享的分阶段计时。
+    phase_timings: Arc<ProxyPhaseTimings>,
     /// 整流器配置
     rectifier_config: RectifierConfig,
     /// 优化器配置
@@ -197,6 +200,32 @@ pub struct RequestForwarder {
 }
 
 impl RequestForwarder {
+    /// 部分严格 OpenAI Chat 上游（mlx_lm.server 等）只接受开头的 system message。
+    /// 仅在上游明确拒绝后重试，避免默认破坏 Claude Code 中途 system 指令的时序与缓存前缀。
+    fn strict_chat_system_retry_should_trigger(
+        &self,
+        adapter_name: &str,
+        provider: &Provider,
+        error: &ProxyError,
+    ) -> bool {
+        if adapter_name != "Claude"
+            || super::providers::get_claude_api_format(provider) != "openai_chat"
+        {
+            return false;
+        }
+        let ProxyError::UpstreamError {
+            status,
+            body: Some(body),
+        } = error
+        else {
+            return false;
+        };
+        matches!(*status, 400 | 404 | 422)
+            && body
+                .to_ascii_lowercase()
+                .contains("system message must be at the beginning")
+    }
+
     /// 预防式 media 降级：发送前对 text-only 模型把图片块替换为标记。
     ///
     /// 受 `enabled && request_media_fallback` 管辖；其中"启发式模型名单预测"
@@ -280,6 +309,7 @@ impl RequestForwarder {
         current_provider_id_at_start: String,
         session_id: String,
         session_client_provided: bool,
+        phase_timings: Arc<ProxyPhaseTimings>,
         streaming_first_byte_timeout: u64,
         _streaming_idle_timeout: u64,
         rectifier_config: RectifierConfig,
@@ -301,6 +331,7 @@ impl RequestForwarder {
             current_provider_id_at_start,
             session_id,
             session_client_provided,
+            phase_timings,
             rectifier_config,
             optimizer_config,
             copilot_optimizer_config,
@@ -719,6 +750,67 @@ impl RequestForwarder {
                     );
                     let mut signature_rectifier_non_retryable_client_error = false;
 
+                    if self.strict_chat_system_retry_should_trigger(adapter.name(), provider, &e) {
+                        let mut strict_body = provider_body.clone();
+                        let moved =
+                            super::providers::transform::hoist_mid_conversation_system_messages(
+                                &mut strict_body,
+                            );
+                        if moved > 0 {
+                            log::info!(
+                                "[{app_type_str}] [ChatCompat] Upstream requires system-at-head; retrying provider={} with {moved} system message(s) hoisted",
+                                provider.id
+                            );
+                            match self
+                                .forward(
+                                    app_type,
+                                    &method,
+                                    provider,
+                                    endpoint,
+                                    &strict_body,
+                                    &headers,
+                                    &extensions,
+                                    adapter.as_ref(),
+                                )
+                                .await
+                            {
+                                Ok(forwarded) => {
+                                    log::info!(
+                                        "[{app_type_str}] [ChatCompat] System-at-head retry succeeded"
+                                    );
+                                    return Ok(self
+                                        .finish_success(
+                                            provider,
+                                            app_type_str,
+                                            used_half_open_permit,
+                                            forwarded,
+                                        )
+                                        .await);
+                                }
+                                Err(retry_err) => {
+                                    log::warn!(
+                                        "[{app_type_str}] [ChatCompat] System-at-head retry still failed: {retry_err}"
+                                    );
+                                    if let Some(err) = self
+                                        .handle_rectifier_retry_failure(
+                                            retry_err,
+                                            provider,
+                                            app_type_str,
+                                            used_half_open_permit,
+                                            "system-at-head compatibility",
+                                            &mut last_error,
+                                            &mut last_provider,
+                                        )
+                                        .await
+                                    {
+                                        return Err(err);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
                     if self.media_retry_should_trigger(
                         adapter.name(),
                         media_rectifier_retried,
@@ -1136,6 +1228,9 @@ impl RequestForwarder {
         extensions: &Extensions,
         adapter: &dyn ProviderAdapter,
     ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
+        self.phase_timings.record_attempt();
+        let request_prepare_timer = self.phase_timings.request_prepare_timer();
+
         // 使用适配器提取 base_url
         let mut base_url = adapter.extract_base_url(provider)?;
 
@@ -2346,6 +2441,7 @@ impl RequestForwarder {
             .get("model")
             .and_then(|v| v.as_str())
             .unwrap_or("<none>");
+        self.phase_timings.set_outbound_model(request_model);
         log::info!("[{tag}] >>> 请求目标: {target_for_log} (model={request_model})");
         log::debug!(
             "[{tag}] >>> 请求体已准备: bytes={}, hash={} (content omitted)",
@@ -2376,7 +2472,9 @@ impl RequestForwarder {
             is_copilot,
         );
 
-        // 发送请求
+        // 发送请求。准备阶段到此结束；响应头计时覆盖连接、TLS、上游排队和首个 HTTP 头。
+        drop(request_prepare_timer);
+        let upstream_headers_timer = self.phase_timings.upstream_headers_timer();
         let response = if is_socks_proxy || !preserve_exact_header_case {
             // OpenAI / Copilot / Codex 类后端不依赖原始 header 大小写；走 reqwest
             // 连接池，避免 raw TCP/TLS path 每次请求都重新握手。SOCKS5 也只能走 reqwest。
@@ -2433,6 +2531,7 @@ impl RequestForwarder {
             )
             .await?
         };
+        drop(upstream_headers_timer);
 
         // 检查响应状态
         let status = response.status();
@@ -2576,10 +2675,8 @@ impl RequestForwarder {
             None => raw.to_vec(),
         };
 
-        if let Some(message) = responses_error_envelope_message(&decoded) {
-            return Err(ProxyError::TransformError(format!(
-                "Responses upstream returned a 2xx failure: {message}"
-            )));
+        if let Some(error) = responses_error_envelope(&decoded) {
+            return Err(error);
         }
 
         Ok(ProxyResponse::buffered(status, headers, raw))
@@ -2590,6 +2687,7 @@ impl RequestForwarder {
         response: ProxyResponse,
     ) -> Result<ProxyResponse, ProxyError> {
         const MAX_PRIME_BYTES: usize = 256 * 1024;
+        let _semantic_prime_timer = self.phase_timings.semantic_prime_timer();
 
         let status = response.status();
         let headers = response.headers().clone();
@@ -2674,6 +2772,7 @@ impl RequestForwarder {
         if self.streaming_first_byte_timeout.is_zero() {
             return Ok(response);
         }
+        let _first_chunk_timer = self.phase_timings.stream_first_chunk_timer();
 
         let status = response.status();
         let headers = response.headers().clone();
@@ -3123,7 +3222,82 @@ fn codex_anthropic_error_envelope_message(body: &[u8]) -> Option<String> {
     Some(format!("{error_type}: {message}"))
 }
 
-fn responses_error_envelope_message(body: &[u8]) -> Option<String> {
+fn responses_error_status(error: &Value, error_type: &str) -> u16 {
+    for key in ["status", "status_code", "http_status", "code"] {
+        let Some(value) = error.get(key) else {
+            continue;
+        };
+        let status = value
+            .as_u64()
+            .and_then(|value| u16::try_from(value).ok())
+            .or_else(|| value.as_str().and_then(|value| value.parse::<u16>().ok()));
+        if let Some(status) = status.filter(|status| (400..=599).contains(status)) {
+            return status;
+        }
+    }
+
+    let error_type = error_type.to_ascii_lowercase();
+    if error_type.contains("service_unavailable") || error_type.contains("overloaded") {
+        // Claude's Anthropic protocol uses 529 for transient capacity exhaustion.
+        529
+    } else if error_type.contains("rate_limit") || error_type.contains("too_many_requests") {
+        429
+    } else if error_type.contains("authentication") || error_type.contains("unauthorized") {
+        401
+    } else if error_type.contains("permission") || error_type.contains("forbidden") {
+        403
+    } else if error_type.contains("not_found") {
+        404
+    } else if error_type.contains("request_too_large") || error_type.contains("payload_too_large") {
+        413
+    } else if error_type.contains("billing") || error_type.contains("payment_required") {
+        402
+    } else if error_type.contains("timeout") {
+        504
+    } else if error_type.contains("invalid_request") || error_type.contains("bad_request") {
+        400
+    } else if error_type.contains("server_error")
+        || error_type.contains("api_error")
+        || error_type.contains("internal_error")
+    {
+        500
+    } else {
+        502
+    }
+}
+
+fn responses_upstream_error(response: &Value, fallback_message: &str) -> ProxyError {
+    let error = response.get("error").unwrap_or(response);
+    let response_status = response.get("status").and_then(Value::as_str);
+    let explicit_type = error
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|error_type| !error_type.trim().is_empty());
+    let error_code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .filter(|error_code| {
+            !error_code.trim().is_empty() && !error_code.bytes().all(|byte| byte.is_ascii_digit())
+        });
+    let error_type = explicit_type
+        .filter(|error_type| !error_type.eq_ignore_ascii_case("error"))
+        .or(error_code)
+        .or(explicit_type)
+        .unwrap_or_else(|| response_status.unwrap_or("error"));
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| error.as_str())
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or(fallback_message);
+
+    ProxyError::UpstreamError {
+        status: responses_error_status(error, error_type),
+        body: Some(format!("{error_type}: {message}")),
+    }
+}
+
+fn responses_error_envelope(body: &[u8]) -> Option<ProxyError> {
     let value: Value = serde_json::from_slice(body).ok()?;
     let status = value.get("status").and_then(Value::as_str);
     let has_error = value.get("error").is_some_and(|error| !error.is_null());
@@ -3131,22 +3305,13 @@ fn responses_error_envelope_message(body: &[u8]) -> Option<String> {
         return None;
     }
 
-    let error = value.get("error").unwrap_or(&value);
-    let error_type = error
-        .get("type")
-        .and_then(Value::as_str)
-        .or_else(|| error.get("code").and_then(Value::as_str))
-        .unwrap_or_else(|| status.unwrap_or("error"));
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .or_else(|| error.as_str())
-        .filter(|message| !message.trim().is_empty())
-        .unwrap_or(match status {
+    Some(responses_upstream_error(
+        &value,
+        match status {
             Some("cancelled") => "response generation was cancelled",
             _ => "response generation failed",
-        });
-    Some(format!("{error_type}: {message}"))
+        },
+    ))
 }
 
 /// Prompt caching is part of the Codex→Anthropic protocol bridge rather than an
@@ -3171,10 +3336,8 @@ fn inspect_responses_json_document(buffer: &str) -> Option<Result<(), ProxyError
         return None;
     }
     let _: Value = serde_json::from_str(trimmed).ok()?;
-    if let Some(message) = responses_error_envelope_message(trimmed.as_bytes()) {
-        return Some(Err(ProxyError::TransformError(format!(
-            "Responses upstream returned a 2xx failure: {message}"
-        ))));
+    if let Some(error) = responses_error_envelope(trimmed.as_bytes()) {
+        return Some(Err(error));
     }
     Some(Ok(()))
 }
@@ -3211,40 +3374,17 @@ fn inspect_responses_start_event(block: &str) -> Option<Result<(), ProxyError>> 
         Some("failed" | "cancelled")
     ) || response.get("error").is_some_and(|error| !error.is_null())
     {
-        let error = response.get("error").unwrap_or(response);
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .or_else(|| error.as_str())
-            .unwrap_or("Responses upstream failed before output");
-        let error_type = error
-            .get("type")
-            .and_then(Value::as_str)
-            .or_else(|| error.get("code").and_then(Value::as_str))
-            .or_else(|| response.get("status").and_then(Value::as_str))
-            .unwrap_or("upstream_error");
-        return Some(Err(ProxyError::TransformError(format!(
-            "Responses upstream {error_type}: {message}"
-        ))));
+        return Some(Err(responses_upstream_error(
+            response,
+            "Responses upstream failed before output",
+        )));
     }
 
     match event {
-        "response.failed" | "error" => {
-            let error = response.get("error").unwrap_or(response);
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .or_else(|| error.as_str())
-                .unwrap_or("Responses upstream emitted an error before output");
-            let error_type = error
-                .get("type")
-                .and_then(Value::as_str)
-                .or_else(|| error.get("code").and_then(Value::as_str))
-                .unwrap_or("upstream_error");
-            Some(Err(ProxyError::TransformError(format!(
-                "Responses upstream {error_type}: {message}"
-            ))))
-        }
+        "response.failed" | "error" => Some(Err(responses_upstream_error(
+            response,
+            "Responses upstream emitted an error before output",
+        ))),
         "response.created" | "response.in_progress" | "response.queued" => None,
         "" => None,
         // Productive output, incomplete, and completed terminals are all safe to
@@ -3611,12 +3751,16 @@ fn should_force_identity_encoding(
 }
 
 fn map_reqwest_send_error(error: reqwest::Error) -> ProxyError {
-    if error.is_timeout() {
-        ProxyError::Timeout(format!("上游请求超时: {}", error.without_url()))
-    } else if error.is_connect() {
-        ProxyError::ForwardFailed(format!("上游连接失败: {}", error.without_url()))
+    let is_timeout = error.is_timeout();
+    let is_connect = error.is_connect();
+    let error = error.without_url();
+    let detail = super::hyper_client::format_error_chain(&error);
+    if is_timeout {
+        ProxyError::Timeout(format!("上游请求超时: {detail}"))
+    } else if is_connect {
+        ProxyError::ForwardFailed(format!("上游连接失败: {detail}"))
     } else {
-        ProxyError::ForwardFailed(format!("上游请求发送失败: {}", error.without_url()))
+        ProxyError::ForwardFailed(format!("上游请求发送失败: {detail}"))
     }
 }
 
@@ -3933,6 +4077,7 @@ mod tests {
             current_provider_id_at_start: String::new(),
             session_id: String::new(),
             session_client_provided: false,
+            phase_timings: Arc::new(ProxyPhaseTimings::default()),
             rectifier_config: RectifierConfig::default(),
             optimizer_config: OptimizerConfig::default(),
             copilot_optimizer_config: CopilotOptimizerConfig::default(),
@@ -4607,25 +4752,131 @@ mod tests {
 
     #[test]
     fn responses_2xx_failure_is_detected_for_failover() {
-        assert_eq!(
-            responses_error_envelope_message(
-                br#"{"status":"failed","error":{"type":"server_error","message":"busy"},"output":[]}"#
-            )
-            .as_deref(),
-            Some("server_error: busy")
-        );
-        assert_eq!(
-            responses_error_envelope_message(br#"{"status":"cancelled","output":[]}"#).as_deref(),
-            Some("cancelled: response generation was cancelled")
-        );
-        assert!(responses_error_envelope_message(
+        assert!(matches!(
+            responses_error_envelope(
+                br#"{"status":"failed","error":{"type":"service_unavailable_error","message":"busy"},"output":[]}"#
+            ),
+            Some(ProxyError::UpstreamError { status: 529, body: Some(message) })
+                if message == "service_unavailable_error: busy"
+        ));
+        assert!(matches!(
+            responses_error_envelope(
+                br#"{"status":"failed","error":{"type":"rate_limit_error","message":"slow down"},"output":[]}"#
+            ),
+            Some(ProxyError::UpstreamError { status: 429, body: Some(message) })
+                if message == "rate_limit_error: slow down"
+        ));
+        assert!(matches!(
+            responses_error_envelope(br#"{"status":"cancelled","output":[]}"#),
+            Some(ProxyError::UpstreamError { status: 502, body: Some(message) })
+                if message == "cancelled: response generation was cancelled"
+        ));
+        assert!(responses_error_envelope(
             br#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}"#
         )
         .is_none());
-        assert!(responses_error_envelope_message(
-            br#"{"status":"completed","error":null,"output":[]}"#
-        )
-        .is_none());
+        assert!(
+            responses_error_envelope(br#"{"status":"completed","error":null,"output":[]}"#)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn responses_generic_error_type_uses_specific_code_for_classification() {
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let provider = test_provider_with_type(None);
+        let assert_classified = |error: ProxyError, status, category| {
+            assert!(matches!(
+                &error,
+                ProxyError::UpstreamError { status: actual, .. } if *actual == status
+            ));
+            assert_eq!(
+                forwarder.categorize_proxy_error(&error, &provider),
+                category
+            );
+        };
+
+        let rate_limited = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"code\":\"rate_limit_exceeded\",\"message\":\"slow down\"}"
+        );
+        let Some(Err(error)) = inspect_responses_start_event(rate_limited) else {
+            panic!("expected standalone SSE error event to fail");
+        };
+        assert!(matches!(
+            &error,
+            ProxyError::UpstreamError { status: 429, body: Some(message) }
+                if message == "rate_limit_exceeded: slow down"
+        ));
+        assert_classified(error, 429, ErrorCategory::Retryable);
+
+        for (body, status, diagnostic, category) in [
+            (
+                br#"{"error":{"type":"error","code":"rate_limit_exceeded","message":"slow down"}}"#.as_slice(),
+                429,
+                "rate_limit_exceeded: slow down",
+                ErrorCategory::Retryable,
+            ),
+            (
+                br#"{"error":{"type":"error","code":"service_unavailable","message":"busy"}}"#.as_slice(),
+                529,
+                "service_unavailable: busy",
+                ErrorCategory::Retryable,
+            ),
+            (
+                br#"{"error":{"type":"error","code":"invalid_request_error","message":"bad input"}}"#.as_slice(),
+                400,
+                "invalid_request_error: bad input",
+                ErrorCategory::NonRetryable,
+            ),
+        ] {
+            let error = responses_error_envelope(body).expect("error envelope");
+            assert!(matches!(
+                &error,
+                ProxyError::UpstreamError { status: actual, body: Some(message) }
+                    if *actual == status && message == diagnostic
+            ));
+            assert_classified(error, status, category);
+        }
+    }
+
+    #[test]
+    fn responses_explicit_numeric_status_precedes_error_code_and_numeric_code_is_not_diagnostic() {
+        let forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+        let provider = test_provider_with_type(None);
+
+        let explicit_status = responses_upstream_error(
+            &json!({
+                "type": "error",
+                "code": "rate_limit_exceeded",
+                "status_code": 503,
+                "message": "maintenance"
+            }),
+            "fallback",
+        );
+        assert!(matches!(
+            &explicit_status,
+            ProxyError::UpstreamError { status: 503, body: Some(message) }
+                if message == "rate_limit_exceeded: maintenance"
+        ));
+        assert_eq!(
+            forwarder.categorize_proxy_error(&explicit_status, &provider),
+            ErrorCategory::Retryable
+        );
+
+        let numeric_code = responses_upstream_error(
+            &json!({ "type": "error", "code": 503, "message": "maintenance" }),
+            "fallback",
+        );
+        assert!(matches!(
+            &numeric_code,
+            ProxyError::UpstreamError { status: 503, body: Some(message) }
+                if message == "error: maintenance"
+        ));
+        assert_eq!(
+            forwarder.categorize_proxy_error(&numeric_code, &provider),
+            ErrorCategory::Retryable
+        );
     }
 
     #[test]
@@ -4638,11 +4889,22 @@ mod tests {
 
         let failed = concat!(
             "event: response.failed\n",
-            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"server_error\",\"message\":\"boom\"}}}"
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"service_unavailable_error\",\"message\":\"boom\"}}}"
         );
         assert!(matches!(
             inspect_responses_start_event(failed),
-            Some(Err(ProxyError::TransformError(message))) if message.contains("boom")
+            Some(Err(ProxyError::UpstreamError { status: 529, body: Some(message) }))
+                if message == "service_unavailable_error: boom"
+        ));
+
+        let rate_limited = concat!(
+            "event: error\n",
+            "data: {\"type\":\"rate_limit_error\",\"message\":\"slow down\"}"
+        );
+        assert!(matches!(
+            inspect_responses_start_event(rate_limited),
+            Some(Err(ProxyError::UpstreamError { status: 429, body: Some(message) }))
+                if message == "rate_limit_error: slow down"
         ));
 
         let delta = concat!(
@@ -4670,7 +4932,7 @@ mod tests {
             r#"{"status":"failed","error":{"message":"backend unavailable"}}"#,
         );
         assert!(
-            matches!(failed, Some(Err(ProxyError::TransformError(message))) if message.contains("backend unavailable"))
+            matches!(failed, Some(Err(ProxyError::UpstreamError { status: 502, body: Some(message) })) if message == "failed: backend unavailable")
         );
     }
 
@@ -6224,6 +6486,15 @@ mod tests {
             provider
         }
 
+        fn openai_chat_provider(id: &str, upstream: &Upstream) -> Provider {
+            let mut provider = provider(id, upstream);
+            provider.meta = Some(crate::provider::ProviderMeta {
+                api_format: Some("openai_chat".to_string()),
+                ..Default::default()
+            });
+            provider
+        }
+
         fn forwarder(max_attempts: usize, provider_at_start: &str) -> RequestForwarder {
             // 真正发请求要用 HTTP 客户端；应用启动时装的 rustls 后端测试里没有（同 lib.rs）。
             let _ = rustls::crypto::ring::default_provider().install_default();
@@ -6267,6 +6538,23 @@ mod tests {
                     "content": [{ "type": "text", "text": "ok" }],
                     "stop_reason": "end_turn",
                     "usage": { "input_tokens": 1, "output_tokens": 1 }
+                }),
+            )
+        }
+
+        fn chat_ok() -> (u16, Value) {
+            (
+                200,
+                json!({
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "model": "default_model",
+                    "choices": [{
+                        "index": 0,
+                        "message": { "role": "assistant", "content": "ok" },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
                 }),
             )
         }
@@ -6374,6 +6662,48 @@ mod tests {
                 Ok(_) => panic!("expected the request to fail"),
                 Err(err) => err,
             }
+        }
+
+        #[tokio::test]
+        async fn strict_chat_upstream_hoists_mid_system_and_retries_once() {
+            const ERROR: &str = "System message must be at the beginning.";
+            let up = upstream(vec![error(404, ERROR), chat_ok()]).await;
+            let fwd = forwarder(1, "qwen");
+            let body = json!({
+                "model": "default_model",
+                "max_tokens": 128,
+                "system": "Top level.",
+                "messages": [
+                    { "role": "user", "content": "Hello" },
+                    { "role": "assistant", "content": "Hi" },
+                    { "role": "system", "content": "Mid conversation." },
+                    { "role": "user", "content": "Continue" }
+                ]
+            });
+
+            let result = send(&fwd, vec![openai_chat_provider("qwen", &up)], body).await;
+
+            assert_eq!(result.ok().map(|r| r.provider.id), Some("qwen".into()));
+            let requests = up.requests.lock().await;
+            assert_eq!(requests.len(), 2);
+            let first = requests[0]["messages"].as_array().unwrap();
+            assert_eq!(
+                first
+                    .iter()
+                    .filter(|message| message["role"] == "system")
+                    .count(),
+                2
+            );
+            let second = requests[1]["messages"].as_array().unwrap();
+            assert_eq!(second[0]["role"], "system");
+            assert_eq!(second[0]["content"], "Top level.\n\nMid conversation.");
+            assert_eq!(
+                second
+                    .iter()
+                    .filter(|message| message["role"] == "system")
+                    .count(),
+                1
+            );
         }
 
         #[tokio::test]

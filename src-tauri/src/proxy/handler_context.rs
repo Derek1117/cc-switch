@@ -9,11 +9,12 @@ use crate::proxy::{
     extract_session_id,
     forwarder::RequestForwarder,
     server::ProxyState,
+    timing::ProxyPhaseTimings,
     types::{AppProxyConfig, CopilotOptimizerConfig, OptimizerConfig, RectifierConfig},
     ProxyError,
 };
 use axum::http::HeaderMap;
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 /// 流式超时配置
 #[derive(Debug, Clone, Copy)]
@@ -36,6 +37,8 @@ pub struct StreamingTimeoutConfig {
 pub struct RequestContext {
     /// 请求开始时间
     pub start_time: Instant,
+    /// 不含请求内容的分阶段性能计时。
+    pub phase_timings: Arc<ProxyPhaseTimings>,
     /// 应用级代理配置（per-app，包含重试次数和超时配置）
     pub app_config: AppProxyConfig,
     /// 选中的 Provider（故障转移链的第一个）
@@ -99,6 +102,7 @@ impl RequestContext {
         stack: Option<StackTarget>,
     ) -> Result<Self, ProxyError> {
         let start_time = Instant::now();
+        let phase_timings = Arc::new(ProxyPhaseTimings::default());
 
         // 从数据库读取应用级代理配置（per-app）
         let mut app_config = state
@@ -204,8 +208,11 @@ impl RequestContext {
             }
         };
 
+        phase_timings.set_context(start_time.elapsed());
+
         Ok(Self {
             start_time,
+            phase_timings,
             app_config,
             provider,
             providers,
@@ -283,6 +290,7 @@ impl RequestContext {
             self.current_provider_id.clone(),
             self.session_id.clone(),
             self.session_client_provided,
+            self.phase_timings.clone(),
             first_byte_timeout,
             idle_timeout,
             self.rectifier_config.clone(),

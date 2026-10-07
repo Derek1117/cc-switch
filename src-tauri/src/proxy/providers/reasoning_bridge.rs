@@ -2,13 +2,15 @@
 //!
 //! The Anthropic Messages protocol has no field for an OpenAI Responses
 //! `reasoning` item. To keep stateless tool loops lossless, the complete item is
-//! carried in a versioned thinking signature/redacted-thinking payload and
-//! restored when the client replays the assistant message.
+//! carried in a versioned thinking signature and restored when the client
+//! replays the assistant message. Opaque items use a signed placeholder instead
+//! of `redacted_thinking`, which some Claude Code protocol consumers reject.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde_json::{json, Value};
 
 pub(crate) const OPENAI_REASONING_ITEM_PREFIX: &str = "ccswitch-openai-reasoning-v1:";
+pub(crate) const OPAQUE_REASONING_PLACEHOLDER: &str = "[redacted thinking]";
 
 pub(crate) fn reasoning_summary_text(item: &Value) -> String {
     item.get("summary")
@@ -60,8 +62,9 @@ pub(crate) fn anthropic_block_from_openai_reasoning_item(item: &Value) -> Option
         let envelope = encode_openai_reasoning_item(item)?;
         if text.is_empty() {
             return Some(json!({
-                "type": "redacted_thinking",
-                "data": envelope
+                "type": "thinking",
+                "thinking": OPAQUE_REASONING_PLACEHOLDER,
+                "signature": envelope
             }));
         }
         return Some(json!({
@@ -114,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_item_without_summary_uses_redacted_thinking() {
+    fn encrypted_item_without_summary_uses_signed_thinking_placeholder() {
         let item = json!({
             "id": "rs_2",
             "type": "reasoning",
@@ -122,7 +125,8 @@ mod tests {
             "encrypted_content": "opaque"
         });
         let block = anthropic_block_from_openai_reasoning_item(&item).unwrap();
-        assert_eq!(block["type"], "redacted_thinking");
+        assert_eq!(block["type"], "thinking");
+        assert_eq!(block["thinking"], OPAQUE_REASONING_PLACEHOLDER);
         assert_eq!(
             openai_reasoning_item_from_anthropic_block(&block),
             Some(item)

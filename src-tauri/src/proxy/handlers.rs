@@ -3120,15 +3120,25 @@ fn log_forward_error(
     let status_code = map_proxy_error_to_status(error);
     let error_message = get_error_message(error);
     let request_id = uuid::Uuid::new_v4().to_string();
+    let latency_ms = ctx.latency_ms();
+    ctx.phase_timings
+        .log(ctx.app_type_str, &ctx.session_id, latency_ms, None, "error");
+
+    let outbound_model = ctx
+        .phase_timings
+        .outbound_model()
+        .or_else(|| ctx.outbound_model.clone())
+        .unwrap_or_else(|| ctx.request_model.clone());
 
     if let Err(e) = logger.log_error_with_context(
         request_id,
         ctx.provider.id.clone(),
         ctx.app_type_str.to_string(),
+        outbound_model,
         ctx.request_model.clone(),
         status_code,
         error_message,
-        ctx.latency_ms(),
+        latency_ms,
         is_streaming,
         Some(ctx.session_id.clone()),
         None,

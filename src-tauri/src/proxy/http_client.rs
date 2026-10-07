@@ -212,6 +212,19 @@ pub fn is_proxy_enabled() -> bool {
     get_current_proxy_url().is_some()
 }
 
+/// 显式全局代理也必须绕过本机回环地址：本地模型、Ollama、MLX 等上游
+/// 常驻 127.0.0.1；把它们送进 Clash/HTTP 代理会被代理返回 503。
+fn explicit_proxy_no_proxy() -> Option<reqwest::NoProxy> {
+    let mut entries = env::var("NO_PROXY")
+        .or_else(|_| env::var("no_proxy"))
+        .unwrap_or_default();
+    if !entries.trim().is_empty() {
+        entries.push(',');
+    }
+    entries.push_str("localhost,127.0.0.0/8,::1");
+    reqwest::NoProxy::from_string(&entries)
+}
+
 /// 构建 HTTP 客户端
 fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
     let mut builder = Client::builder()
@@ -242,9 +255,13 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
         }
 
         let proxy = reqwest::Proxy::all(url)
-            .map_err(|e| format!("Invalid proxy URL '{}': {}", mask_url(url), e))?;
+            .map_err(|e| format!("Invalid proxy URL '{}': {}", mask_url(url), e))?
+            .no_proxy(explicit_proxy_no_proxy());
         builder = builder.proxy(proxy);
-        log::debug!("[GlobalProxy] Proxy configured: {}", mask_url(url));
+        log::debug!(
+            "[GlobalProxy] Proxy configured: {} (loopback targets bypassed)",
+            mask_url(url)
+        );
     } else {
         // 未设置全局代理时，让 reqwest 自动检测系统代理（环境变量）
         // 若系统代理指向本机，禁用系统代理避免自环
@@ -391,6 +408,57 @@ mod tests {
     fn test_build_client_with_http_proxy() {
         let result = build_client(Some("http://127.0.0.1:7890"));
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn explicit_proxy_bypasses_loopback_upstream() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target_listener.local_addr().unwrap().port();
+        let target_server = tokio::spawn(async move {
+            let (mut stream, _) = target_listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+                .await
+                .unwrap();
+        });
+
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = proxy_listener.local_addr().unwrap().port();
+        let proxy_hit = Arc::new(AtomicBool::new(false));
+        let proxy_hit_in_task = proxy_hit.clone();
+        let proxy_server = tokio::spawn(async move {
+            let (mut stream, _) = proxy_listener.accept().await.unwrap();
+            proxy_hit_in_task.store(true, Ordering::SeqCst);
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 5\r\nConnection: close\r\n\r\nPROXY",
+                )
+                .await
+                .unwrap();
+        });
+
+        let client = build_client(Some(&format!("http://127.0.0.1:{proxy_port}"))).unwrap();
+        let response = client
+            .get(format!("http://127.0.0.1:{target_port}/health"))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+
+        target_server.abort();
+        proxy_server.abort();
+        assert!(!proxy_hit.load(Ordering::SeqCst));
+        assert_eq!(status, reqwest::StatusCode::OK);
+        assert_eq!(body, "OK");
     }
 
     #[test]

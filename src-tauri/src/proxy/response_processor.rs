@@ -526,14 +526,22 @@ pub(crate) fn create_usage_collector(
     let stream_parser = parser_config.stream_parser;
     let model_extractor = parser_config.model_extractor;
     let session_id = ctx.session_id.clone();
+    let phase_timings = ctx.phase_timings.clone();
 
     Some(SseUsageCollector::new(
         start_time,
         parser_config.stream_event_filter,
         move |events, first_token_ms| {
+            let latency_ms = start_time.elapsed().as_millis() as u64;
+            phase_timings.log(
+                app_type_str,
+                &session_id,
+                latency_ms,
+                first_token_ms,
+                "stream_finished",
+            );
             if let Some(usage) = stream_parser(&events) {
                 let model = model_extractor(&events, &fallback_model);
-                let latency_ms = start_time.elapsed().as_millis() as u64;
 
                 let state = state.clone();
                 let provider_id = provider_id.clone();
@@ -560,7 +568,6 @@ pub(crate) fn create_usage_collector(
                 });
             } else {
                 let model = model_extractor(&events, &fallback_model);
-                let latency_ms = start_time.elapsed().as_millis() as u64;
                 let state = state.clone();
                 let provider_id = provider_id.clone();
                 let session_id = session_id.clone();
@@ -619,6 +626,8 @@ fn spawn_log_usage(
         .unwrap_or_else(|| ctx.request_model.clone());
     let latency_ms = ctx.latency_ms();
     let session_id = ctx.session_id.clone();
+    ctx.phase_timings
+        .log(ctx.app_type_str, &session_id, latency_ms, None, "success");
 
     tokio::spawn(async move {
         log_usage_internal(

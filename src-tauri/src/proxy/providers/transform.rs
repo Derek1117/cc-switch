@@ -157,6 +157,68 @@ pub fn anthropic_to_openai(body: Value) -> Result<Value, ProxyError> {
     anthropic_to_openai_with_reasoning_content(body, false)
 }
 
+/// 将 `messages[]` 中途出现的 system 指令合并到顶层 `system`。
+///
+/// Claude Code 支持中途 system message，但部分严格 OpenAI Chat 上游（例如
+/// mlx_lm.server）只接受第一条 system。默认转换仍保持原位；只有上游明确报
+/// "System message must be at the beginning" 后，forwarder 才用此函数重试一次。
+pub(crate) fn hoist_mid_conversation_system_messages(body: &mut Value) -> usize {
+    fn collect_text(value: &Value, output: &mut Vec<String>) {
+        if let Some(text) = value.as_str() {
+            if !text.trim().is_empty() {
+                output.push(text.to_string());
+            }
+            return;
+        }
+        if let Some(blocks) = value.as_array() {
+            output.extend(
+                blocks
+                    .iter()
+                    .filter_map(|block| block.get("text").and_then(Value::as_str))
+                    .filter(|text| !text.trim().is_empty())
+                    .map(ToString::to_string),
+            );
+        }
+    }
+
+    let mut moved = Vec::new();
+    let moved_count = {
+        let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+            return 0;
+        };
+        let original = std::mem::take(messages);
+        let mut count = 0;
+        for message in original {
+            if message.get("role").and_then(Value::as_str) == Some("system") {
+                if let Some(content) = message.get("content") {
+                    collect_text(content, &mut moved);
+                }
+                count += 1;
+            } else {
+                messages.push(message);
+            }
+        }
+        count
+    };
+
+    if moved_count == 0 {
+        return 0;
+    }
+
+    let mut system = Vec::new();
+    if let Some(existing) = body.get("system") {
+        collect_text(existing, &mut system);
+    }
+    system.extend(moved);
+    if system.is_empty() {
+        body.as_object_mut().map(|object| object.remove("system"));
+    } else {
+        body["system"] = json!(system.join("\n\n"));
+    }
+
+    moved_count
+}
+
 /// Anthropic 请求 → OpenAI Chat Completions 请求
 ///
 /// `preserve_reasoning_content` 仅用于明确需要 DeepSeek/MiMo
@@ -988,6 +1050,32 @@ mod tests {
             "You are Claude Code.\nBe concise."
         );
         assert!(result["messages"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn hoist_mid_conversation_system_messages_for_strict_chat_upstream() {
+        let mut input = json!({
+            "system": [{"type":"text","text":"Top level."}],
+            "messages": [
+                {"role":"user","content":"Hello"},
+                {"role":"assistant","content":"Hi"},
+                {"role":"system","content":"Mid one."},
+                {"role":"system","content":[{"type":"text","text":"Mid two."}]},
+                {"role":"user","content":"Continue"}
+            ]
+        });
+
+        assert_eq!(hoist_mid_conversation_system_messages(&mut input), 2);
+        assert_eq!(input["system"], "Top level.\n\nMid one.\n\nMid two.");
+        assert_eq!(
+            input["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|message| message["role"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["user", "assistant", "user"]
+        );
     }
 
     #[test]

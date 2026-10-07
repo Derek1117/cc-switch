@@ -300,6 +300,7 @@ impl<'a> UsageLogger<'a> {
         provider_id: String,
         app_type: String,
         model: String,
+        request_model: String,
         status_code: u16,
         error_message: String,
         latency_ms: u64,
@@ -307,7 +308,6 @@ impl<'a> UsageLogger<'a> {
         session_id: Option<String>,
         provider_type: Option<String>,
     ) -> Result<(), AppError> {
-        let request_model = model.clone();
         let log = RequestLog {
             request_id,
             provider_id,

@@ -3219,6 +3219,34 @@ mod tests {
     }
 
     #[test]
+    fn test_anthropic_to_responses_drops_foreign_redacted_thinking() {
+        let input = json!({
+            "model": "gpt-5.6-sol",
+            "max_tokens": 1024,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "redacted_thinking", "data": "opaque-anthropic-payload"},
+                        {"type": "tool_use", "id": "call_1", "name": "Read", "input": {"path": "README.md"}}
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "call_1", "content": "ok"}
+                    ]
+                }
+            ]
+        });
+
+        let result = anthropic_to_responses(input, None, true, false).unwrap();
+        assert!(!result.to_string().contains("redacted_thinking"));
+        assert_eq!(result["input"][0]["type"], "function_call");
+        assert_eq!(result["input"][1]["type"], "function_call_output");
+    }
+
+    #[test]
     fn test_anthropic_to_responses_with_system_string() {
         let input = json!({
             "model": "gpt-4o",

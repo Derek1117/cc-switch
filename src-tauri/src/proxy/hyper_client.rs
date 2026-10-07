@@ -10,7 +10,7 @@ use futures::{stream::Stream, StreamExt};
 use http_body_util::BodyExt;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use std::sync::OnceLock;
+use std::{error::Error as StdError, sync::OnceLock};
 
 /// Our own header case map: maps lowercase header name → original wire-casing bytes.
 ///
@@ -93,6 +93,19 @@ pub enum ProxyResponse {
         headers: http::HeaderMap,
         stream: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
     },
+}
+
+pub(crate) fn format_error_chain(error: &(dyn StdError + 'static)) -> String {
+    let mut messages = Vec::new();
+    let mut current = Some(error);
+    while let Some(source) = current {
+        let message = source.to_string();
+        if messages.last() != Some(&message) {
+            messages.push(message);
+        }
+        current = source.source();
+    }
+    messages.join(": ")
 }
 
 impl ProxyResponse {
@@ -224,9 +237,12 @@ impl ProxyResponse {
                     as std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>
             }
             Self::Reqwest(r) => {
-                let stream = r
-                    .bytes_stream()
-                    .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
+                let stream = r.bytes_stream().map(|result| {
+                    result.map_err(|error| {
+                        let error = error.without_url();
+                        std::io::Error::other(format_error_chain(&error))
+                    })
+                });
                 Box::pin(stream)
             }
             Self::Buffered { body, .. } => Box::pin(futures::stream::once(async move { Ok(body) }))
@@ -789,6 +805,35 @@ mod tests {
         assert!(buffered_with_content_type(Some("application/problem+json")).is_json());
         assert!(!buffered_with_content_type(Some("text/event-stream")).is_json());
         assert!(!buffered_with_content_type(None).is_json());
+    }
+
+    #[test]
+    fn error_chain_preserves_nested_body_decode_cause() {
+        #[derive(Debug)]
+        struct BodyDecodeError(std::io::Error);
+
+        impl std::fmt::Display for BodyDecodeError {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("error decoding response body")
+            }
+        }
+
+        impl std::error::Error for BodyDecodeError {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let inner = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "truncated HTTP body");
+        let outer = BodyDecodeError(inner);
+
+        let formatted = format_error_chain(&outer);
+
+        assert_eq!(
+            formatted,
+            "error decoding response body: truncated HTTP body"
+        );
+        assert!(!outer.to_string().contains("truncated HTTP body"));
     }
 
     #[tokio::test]
