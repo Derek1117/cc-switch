@@ -29,3 +29,9 @@ copilot-api
 .history
 CODEBUDDY.md
 mainWindow.js
+
+# Local development tooling
+/.agent-mq
+/.codegraph
+/.serena
+/.codebase-memory
